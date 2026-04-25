@@ -1004,7 +1004,7 @@ fn thread_list_params(
             .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
-        use_state_db_only: false,
+        use_state_db_only: true,
         search_term: None,
     }
 }
@@ -1571,6 +1571,7 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
+        assert!(params.use_state_db_only);
         assert_eq!(
             params.source_kinds,
             Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode])
@@ -1593,6 +1594,7 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
+        assert!(params.use_state_db_only);
         assert_eq!(params.source_kinds, None);
     }
 
