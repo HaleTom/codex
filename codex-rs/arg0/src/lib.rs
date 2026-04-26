@@ -3,6 +3,18 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 
+fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
+    let path_display = path.display();
+    std::io::Error::new(
+        err.kind(),
+        format!("failed to {operation} `{path_display}`: {err}"),
+    )
+}
+
+fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{context}: {err}"))
+}
+
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
@@ -282,10 +294,10 @@ where
 /// IMPORTANT: This function modifies the PATH environment variable, so it MUST
 /// be called before multiple threads are spawned.
 pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGuard> {
-    let codex_home = find_codex_home()?;
+    let codex_home = find_codex_home().map_err(|e| with_context(e, "resolve CODEX_HOME"))?;
+    // Guard against placing helpers in system temp directories outside debug builds.
     #[cfg(not(debug_assertions))]
     {
-        // Guard against placing helpers in system temp directories outside debug builds.
         let temp_root = std::env::temp_dir();
         if codex_home.starts_with(&temp_root) {
             return Err(std::io::Error::new(
@@ -297,16 +309,18 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         }
     }
 
-    std::fs::create_dir_all(&codex_home)?;
-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+    std::fs::create_dir_all(&codex_home)
+        .map_err(|e| with_path_context(e, &codex_home, "create CODEX_HOME directory"))?;
     let temp_root = codex_home.join("tmp").join("arg0");
-    std::fs::create_dir_all(&temp_root)?;
+    std::fs::create_dir_all(&temp_root)
+        .map_err(|e| with_path_context(e, &temp_root, "create temp directory"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         // Ensure only the current user can access the temp directory.
-        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| with_path_context(e, &temp_root, "set permissions"))?;
     }
 
     // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
@@ -316,7 +330,8 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
 
     let temp_dir = tempfile::Builder::new()
         .prefix("codex-arg0")
-        .tempdir_in(&temp_root)?;
+        .tempdir_in(&temp_root)
+        .map_err(|e| with_path_context(e, &temp_root, "create temp directory for arg0"))?;
     let path = temp_dir.path();
 
     let lock_path = path.join(LOCK_FILENAME);
@@ -325,8 +340,11 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)?;
-    lock_file.try_lock()?;
+        .open(&lock_path)
+        .map_err(|e| with_path_context(e, &lock_path, "open lock file"))?;
+    lock_file
+        .try_lock()
+        .map_err(|e| with_path_context(std::io::Error::from(e), &lock_path, "acquire lock"))?;
 
     for filename in &[
         APPLY_PATCH_ARG0,
@@ -336,12 +354,13 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         #[cfg(unix)]
         EXECVE_WRAPPER_ARG0,
     ] {
-        let exe = std::env::current_exe()?;
+        let exe =
+            std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?;
 
         #[cfg(unix)]
         {
             let link = path.join(filename);
-            symlink(&exe, &link)?;
+            symlink(&exe, &link).map_err(|e| with_path_context(e, &link, "create symlink"))?;
         }
 
         #[cfg(windows)]
@@ -353,9 +372,10 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
                 format!(
                     r#"@echo off
 "{exe}" {CODEX_CORE_APPLY_PATCH_ARG1} %*
-"#,
+"#
                 ),
-            )?;
+            )
+            .map_err(|e| with_path_context(e, &batch_script, "write batch script"))?;
         }
     }
 
@@ -581,5 +601,34 @@ mod tests {
 
         assert!(!dir.exists());
         Ok(())
+    }
+
+    #[test]
+    fn with_path_context_includes_operation_and_path() {
+        use super::with_path_context;
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let path = std::path::PathBuf::from("/some/missing/path");
+        let enriched = with_path_context(not_found, &path, "read config file");
+        assert_eq!(enriched.kind(), std::io::ErrorKind::NotFound);
+        let msg = enriched.to_string();
+        assert!(msg.contains("read config file"), "missing operation: {msg}");
+        assert!(msg.contains("/some/missing/path"), "missing path: {msg}");
+    }
+
+    #[test]
+    fn with_context_includes_custom_message() {
+        use super::with_context;
+        let permission_denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operation not permitted",
+        );
+        let enriched = with_context(permission_denied, "resolve CODEX_HOME");
+        assert_eq!(enriched.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = enriched.to_string();
+        assert!(msg.contains("resolve CODEX_HOME"), "missing context: {msg}");
+        assert!(
+            msg.contains("operation not permitted"),
+            "missing original error: {msg}"
+        );
     }
 }
