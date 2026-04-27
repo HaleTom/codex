@@ -3,18 +3,6 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 
-fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
-    let path_display = path.display();
-    std::io::Error::new(
-        err.kind(),
-        format!("failed to {operation} `{path_display}`: {err}"),
-    )
-}
-
-fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
-    std::io::Error::new(err.kind(), format!("{context}: {err}"))
-}
-
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
@@ -277,6 +265,18 @@ where
             unsafe { std::env::set_var(&key, &value) };
         }
     }
+}
+
+fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
+    let path_display = path.display();
+    std::io::Error::new(
+        err.kind(),
+        format!("failed to {operation} `{path_display}`: {err}"),
+    )
+}
+
+fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{context}: {err}"))
 }
 
 /// Creates a temporary directory with either:
