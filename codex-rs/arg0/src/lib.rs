@@ -396,11 +396,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
             let exe = exe.display();
             std::fs::write(
                 &batch_script,
-                format!(
-                    r#"@echo off
-"{exe}" {CODEX_CORE_APPLY_PATCH_ARG1} %*
-"#
-                ),
+                format!("@echo off\r\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
             )
             .map_err(|e| with_path_context(e, &batch_script, "write batch script"))?;
         }
@@ -635,11 +631,12 @@ mod tests {
         use super::with_path_context;
         let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let path = std::path::PathBuf::from("/some/missing/path");
+        let expected = path.display().to_string();
         let enriched = with_path_context(not_found, &path, "read config file");
         assert_eq!(enriched.kind(), std::io::ErrorKind::NotFound);
         let msg = enriched.to_string();
         assert!(msg.contains("read config file"), "missing operation: {msg}");
-        assert!(msg.contains("/some/missing/path"), "missing path: {msg}");
+        assert!(msg.contains(&expected), "missing path: {msg}");
         assert!(
             msg.contains("no such file"),
             "missing original message: {msg}"
