@@ -285,13 +285,32 @@ impl std::error::Error for ContextIoError {
     }
 }
 
+/// Walks the `source` chain of an `io::Error` to find the underlying
+/// `raw_os_error()`, if any. This is needed because `io::Error::new`
+/// clears `raw_os_error()` on the outer error even when the original
+/// was an OS error.
+fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
+    use std::error::Error;
+    if let Some(code) = err.raw_os_error() {
+        return Some(code);
+    }
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            if let Some(code) = io_err.raw_os_error() {
+                return Some(code);
+            }
+        }
+        source = s.source();
+    }
+    None
+}
+
 /// Wraps an `io::Error` with path and operation context.
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
-/// Callers that need the raw OS error code can retrieve it by walking the
-/// source chain, for example:
-/// `err.get_ref().and_then(|e| e.source().and_then(|s| s.downcast_ref::<io::Error>()).map(|io| io.raw_os_error())).flatten()`.
+/// Use `deep_raw_os_error(&err)` to retrieve the original OS error code.
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
@@ -306,7 +325,7 @@ fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::
 /// Wraps an `io::Error` with a context string.
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
-/// the original was an OS error. Retrieve the original via the source chain.
+/// the original was an OS error. Use `deep_raw_os_error(&err)` to retrieve it.
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
@@ -664,8 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn with_path_context_preserves_raw_os_error_via_source_chain() {
-        use super::with_path_context;
+    fn deep_raw_os_error_retrieves_original_os_code() {
+        use super::{deep_raw_os_error, with_path_context};
         let eofs = std::io::Error::from_raw_os_error(30);
         let path = std::path::PathBuf::from("/readonly/fs");
         let enriched = with_path_context(eofs, &path, "open");
@@ -673,18 +692,10 @@ mod tests {
             enriched.raw_os_error().is_none(),
             "outer raw_os_error should be None (cleared by Error::new)"
         );
-        let inner = enriched
-            .get_ref()
-            .expect("should have a ContextIoError source")
-            .source()
-            .expect("ContextIoError should expose inner source");
-        let inner_io = inner
-            .downcast_ref::<std::io::Error>()
-            .expect("inner source should be io::Error");
         assert_eq!(
-            inner_io.raw_os_error(),
+            deep_raw_os_error(&enriched),
             Some(30),
-            "original raw_os_error must be retrievable via source chain"
+            "deep_raw_os_error should find the original OS error code"
         );
     }
 
