@@ -346,6 +346,9 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .try_lock()
         .map_err(|e| with_path_context(std::io::Error::from(e), &lock_path, "acquire lock"))?;
 
+    let exe =
+        std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?;
+
     for filename in &[
         APPLY_PATCH_ARG0,
         MISSPELLED_APPLY_PATCH_ARG0,
@@ -354,9 +357,6 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         #[cfg(unix)]
         EXECVE_WRAPPER_ARG0,
     ] {
-        let exe =
-            std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?;
-
         #[cfg(unix)]
         {
             let link = path.join(filename);
