@@ -285,6 +285,12 @@ impl std::error::Error for ContextIoError {
     }
 }
 
+/// Wraps an `io::Error` with path and operation context.
+///
+/// **Note:** The returned error's `raw_os_error()` returns `None` even when
+/// the original was an OS error, because `io::Error::new` clears it.
+/// Callers that need the raw OS error code can retrieve it via the source
+/// chain: `err.get_ref().and_then(|e| e.source().and_downcast::<io::Error>().raw_os_error())`.
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
@@ -296,6 +302,10 @@ fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::
     )
 }
 
+/// Wraps an `io::Error` with a context string.
+///
+/// **Note:** The returned error's `raw_os_error()` returns `None` even when
+/// the original was an OS error. Retrieve the original via the source chain.
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
@@ -649,6 +659,31 @@ mod tests {
         assert!(
             source.to_string().contains("no such file"),
             "source chain lost original error: {source}"
+        );
+    }
+
+    #[test]
+    fn with_path_context_preserves_raw_os_error_via_source_chain() {
+        use super::with_path_context;
+        let eofs = std::io::Error::from_raw_os_error(30);
+        let path = std::path::PathBuf::from("/readonly/fs");
+        let enriched = with_path_context(eofs, &path, "open");
+        assert!(
+            enriched.raw_os_error().is_none(),
+            "outer raw_os_error should be None (cleared by Error::new)"
+        );
+        let inner = enriched
+            .get_ref()
+            .expect("should have a ContextIoError source")
+            .source()
+            .expect("ContextIoError should expose inner source");
+        let inner_io = inner
+            .downcast_ref::<std::io::Error>()
+            .expect("inner source should be io::Error");
+        assert_eq!(
+            inner_io.raw_os_error(),
+            Some(30),
+            "original raw_os_error must be retrievable via source chain"
         );
     }
 
