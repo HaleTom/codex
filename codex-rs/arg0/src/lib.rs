@@ -295,9 +295,9 @@ where
 /// be called before multiple threads are spawned.
 pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGuard> {
     let codex_home = find_codex_home().map_err(|e| with_context(e, "resolve CODEX_HOME"))?;
-    // Guard against placing helpers in system temp directories outside debug builds.
     #[cfg(not(debug_assertions))]
     {
+        // Guard against placing helpers in system temp directories outside debug builds.
         let temp_root = std::env::temp_dir();
         if codex_home.starts_with(&temp_root) {
             return Err(std::io::Error::new(
