@@ -267,16 +267,43 @@ where
     }
 }
 
+#[derive(Debug)]
+struct ContextIoError {
+    context: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for ContextIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for ContextIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
         err.kind(),
-        format!("failed to {operation} `{path_display}`: {err}"),
+        ContextIoError {
+            context: format!("failed to {operation} `{path_display}`"),
+            source: err,
+        },
     )
 }
 
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
-    std::io::Error::new(err.kind(), format!("{context}: {err}"))
+    std::io::Error::new(
+        err.kind(),
+        ContextIoError {
+            context: context.to_owned(),
+            source: err,
+        },
+    )
 }
 
 /// Creates a temporary directory with either:
@@ -604,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn with_path_context_includes_operation_and_path() {
+    fn with_path_context_includes_operation_path_and_source() {
         use super::with_path_context;
         let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let path = std::path::PathBuf::from("/some/missing/path");
@@ -613,10 +640,23 @@ mod tests {
         let msg = enriched.to_string();
         assert!(msg.contains("read config file"), "missing operation: {msg}");
         assert!(msg.contains("/some/missing/path"), "missing path: {msg}");
+        assert!(
+            msg.contains("no such file"),
+            "missing original message: {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains("no such file"),
+            "source chain lost original error: {source}"
+        );
     }
 
     #[test]
-    fn with_context_includes_custom_message() {
+    fn with_context_includes_custom_message_and_source() {
         use super::with_context;
         let permission_denied = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -629,6 +669,15 @@ mod tests {
         assert!(
             msg.contains("operation not permitted"),
             "missing original error: {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains("operation not permitted"),
+            "source chain lost original error: {source}"
         );
     }
 }
