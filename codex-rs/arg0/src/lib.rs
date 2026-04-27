@@ -289,8 +289,9 @@ impl std::error::Error for ContextIoError {
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
-/// Callers that need the raw OS error code can retrieve it via the source
-/// chain: `err.get_ref().and_then(|e| e.source().and_downcast::<io::Error>().raw_os_error())`.
+/// Callers that need the raw OS error code can retrieve it by walking the
+/// source chain, for example:
+/// `err.get_ref().and_then(|e| e.source().and_then(|s| s.downcast_ref::<io::Error>()).map(|io| io.raw_os_error())).flatten()`.
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
