@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,8 +6,12 @@ use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_home_dir::find_codex_home;
+use fs_err as fs;
+use fs_err::File;
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use fs_err::os::unix::fs::symlink;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 const APPLY_PATCH_ARG0: &str = "apply_patch";
@@ -33,12 +36,12 @@ pub struct Arg0DispatchPaths {
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
-    _lock_file: File,
+    _lock_file: fs_err::File,
     paths: Arg0DispatchPaths,
 }
 
 impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
+    fn new(temp_dir: TempDir, lock_file: fs_err::File, paths: Arg0DispatchPaths) -> Self {
         Self {
             _temp_dir: temp_dir,
             _lock_file: lock_file,
@@ -289,6 +292,7 @@ impl std::error::Error for ContextIoError {
 /// `raw_os_error()`, if any. This is needed because `io::Error::new`
 /// clears `raw_os_error()` on the outer error even when the original
 /// was an OS error.
+#[cfg(test)]
 fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
     use std::error::Error;
     if let Some(code) = err.raw_os_error() {
@@ -366,17 +370,15 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         }
     }
 
-    std::fs::create_dir_all(&codex_home)
+    fs::create_dir_all(&codex_home)
         .map_err(|e| with_path_context(e, &codex_home, "create CODEX_HOME directory"))?;
     let temp_root = codex_home.join("tmp").join("arg0");
-    std::fs::create_dir_all(&temp_root)
+    fs::create_dir_all(&temp_root)
         .map_err(|e| with_path_context(e, &temp_root, "create temp directory"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         // Ensure only the current user can access the temp directory.
-        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&temp_root, PermissionsExt::from_mode(0o700))
             .map_err(|e| with_path_context(e, &temp_root, "set permissions"))?;
     }
 
@@ -392,16 +394,14 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     let path = temp_dir.path();
 
     let lock_path = path.join(LOCK_FILENAME);
-    let lock_file = File::options()
+    let lock_file = fs_err::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)
         .map_err(|e| with_path_context(e, &lock_path, "open lock file"))?;
-    lock_file
-        .try_lock()
-        .map_err(|e| with_path_context(std::io::Error::from(e), &lock_path, "acquire lock"))?;
+    try_lock_arg0_dir(&lock_file, &lock_path)?;
 
     let exe =
         std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?;
@@ -424,7 +424,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         {
             let batch_script = path.join(format!("{filename}.bat"));
             let exe = exe.display();
-            std::fs::write(
+            fs::write(
                 &batch_script,
                 format!("@echo off\r\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
             )
@@ -482,7 +482,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
 }
 
 fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(temp_root) {
+    let entries = match fs::read_dir(temp_root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
@@ -499,7 +499,7 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
             continue;
         };
 
-        match std::fs::remove_dir_all(&path) {
+        match fs::remove_dir_all(&path) {
             Ok(()) => {}
             // Expected TOCTOU race: directory can disappear after read_dir/lock checks.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -512,7 +512,11 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
 
 fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
     let lock_path = dir.join(LOCK_FILENAME);
-    let lock_file = match File::options().read(true).write(true).open(&lock_path) {
+    let lock_file = match fs_err::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
@@ -522,6 +526,31 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
         Ok(()) => Ok(Some(lock_file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Acquires the arg0 lock for the given directory, returning an error with
+/// path and operation context on failure.
+///
+/// Unlike `try_lock_dir` (used by the janitor), this function treats
+/// `WouldBlock` as a real error since it indicates the lock is already held
+/// by another process during normal startup.
+fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> {
+    match lock_file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(with_path_context(
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("lock is already held: {}", lock_path.display()),
+            ),
+            lock_path,
+            "acquire lock",
+        )),
+        Err(err) => Err(with_path_context(
+            std::io::Error::from(err),
+            lock_path,
+            "acquire lock",
+        )),
     }
 }
 
@@ -537,14 +566,13 @@ mod tests {
     #[cfg(unix)]
     use anyhow::ensure;
     use std::fs;
-    use std::fs::File;
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn create_lock(dir: &Path) -> std::io::Result<File> {
+    fn create_lock(dir: &Path) -> std::io::Result<fs_err::File> {
         let lock_path = dir.join(LOCK_FILENAME);
-        File::options()
+        fs_err::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
