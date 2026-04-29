@@ -463,7 +463,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     }
 
     let paths = Arg0DispatchPaths {
-        codex_self_exe: Some(exe.clone()),
+        codex_self_exe: Some(exe),
         codex_linux_sandbox_exe: {
             #[cfg(target_os = "linux")]
             {
