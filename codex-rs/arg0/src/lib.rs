@@ -15,7 +15,6 @@ use fs_err as fs;
 use fs_err::File;
 #[cfg(unix)]
 use fs_err::os::unix::fs::symlink;
-#[cfg(unix)]
 use tempfile::TempDir;
 
 const APPLY_PATCH_ARG0: &str = "apply_patch";
@@ -318,8 +317,9 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
-/// The original OS code is preserved in the source chain and can be retrieved by
-/// walking `err.get_ref().source().downcast_ref::<io::Error>()` iteratively.
+/// The original OS code is preserved in the source chain and can be retrieved
+/// by walking the `source()` chain and calling `downcast_ref::<io::Error>()` on
+/// each source to check `raw_os_error()`.
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
@@ -335,8 +335,8 @@ fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error. The original OS code is preserved in the source
-/// chain and can be retrieved by walking `err.get_ref().source().downcast_ref::<io::Error>()`
-/// iteratively.
+/// chain and can be retrieved by walking the `source()` chain and calling
+/// `downcast_ref::<io::Error>()` on each source to check `raw_os_error()`.
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
@@ -384,6 +384,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .map_err(|e| with_path_context(e, &temp_root, "create temp directory"))?;
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
         // Ensure only the current user can access the temp directory.
         fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| with_path_context(e, &temp_root, "set permissions"))?;
@@ -546,10 +547,7 @@ fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> 
     match lock_file.try_lock() {
         Ok(()) => Ok(()),
         Err(std::fs::TryLockError::WouldBlock) => Err(with_path_context(
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "lock is already held",
-            ),
+            std::io::Error::from(std::fs::TryLockError::WouldBlock),
             lock_path,
             "acquire lock",
         )),
