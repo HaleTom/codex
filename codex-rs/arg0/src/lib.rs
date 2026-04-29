@@ -1,7 +1,9 @@
 #![deny(clippy::disallowed_methods)]
-// Exceptions:
+// Exceptions (allowed inline with #[allow] at use site):
 // - std::fs::TryLockError: fs_err has no lock API; must handle WouldBlock explicitly.
-// - std::fs::create_dir: fs_err has no create_dir (only create_dir_all); used only in tests.
+// - std::fs::Permissions: type constructor, not a filesystem call.
+// - Test-only: std::fs::create_dir (fs_err has no create_dir, only create_dir_all)
+//   and std::fs::write (convenience in test setup, not the code under test).
 
 use std::future::Future;
 use std::path::Path;
@@ -144,7 +146,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     // before creating any threads/the Tokio runtime.
     load_dotenv();
 
-    match prepend_path_entry_for_codex_aliases() {
+    let exe = std::env::current_exe().ok();
+    match prepend_path_entry_for_codex_aliases(exe.as_deref()) {
         Ok(path_entry) => Some(path_entry),
         Err(err) => {
             // It is possible that Codex will proceed successfully even if
@@ -188,12 +191,20 @@ where
     // would be nice to avoid leaving temporary directories behind, if possible.
     let path_entry_guard = arg0_dispatch();
 
+    // Reuse the current_exe from the guard when available, avoiding a
+    // redundant syscall. Fall back to a fresh current_exe() call when the
+    // guard was not created (e.g. prepend_path_entry_for_codex_aliases failed).
+    let current_exe = path_entry_guard
+        .as_ref()
+        .and_then(|g| g.paths().codex_self_exe.clone())
+        .or_else(|| std::env::current_exe().ok());
+
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
     let runtime = build_runtime()?;
     runtime.block_on(run_main_with_arg0_guard(
         path_entry_guard,
-        std::env::current_exe().ok(),
+        current_exe,
         main_fn,
     ))
 }
@@ -303,10 +314,10 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
     }
     let mut source = err.source();
     while let Some(s) = source {
-        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
-            if let Some(code) = io_err.raw_os_error() {
-                return Some(code);
-            }
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>()
+            && let Some(code) = io_err.raw_os_error()
+        {
+            return Some(code);
         }
         source = s.source();
     }
@@ -314,6 +325,11 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
 }
 
 /// Wraps an `io::Error` with path and operation context.
+///
+/// Use this for operations **not** covered by `fs_err`'s built-in path
+/// reporting (e.g. lock acquire). For `fs_err` calls that already include
+/// the path in their error message, prefer [`with_context`] instead to
+/// avoid duplicating the path in the output.
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
@@ -361,7 +377,9 @@ fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
 ///
 /// IMPORTANT: This function modifies the PATH environment variable, so it MUST
 /// be called before multiple threads are spawned.
-pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGuard> {
+pub fn prepend_path_entry_for_codex_aliases(
+    exe: Option<&Path>,
+) -> std::io::Result<Arg0PathEntryGuard> {
     let codex_home = find_codex_home().map_err(|e| with_context(e, "resolve CODEX_HOME"))?;
     #[cfg(not(debug_assertions))]
     {
@@ -377,17 +395,15 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         }
     }
 
-    fs::create_dir_all(&codex_home)
-        .map_err(|e| with_path_context(e, &codex_home, "create CODEX_HOME directory"))?;
+    fs::create_dir_all(&codex_home).map_err(|e| with_context(e, "create CODEX_HOME directory"))?;
     let temp_root = codex_home.join("tmp").join("arg0");
-    fs::create_dir_all(&temp_root)
-        .map_err(|e| with_path_context(e, &temp_root, "create temp directory"))?;
+    fs::create_dir_all(&temp_root).map_err(|e| with_context(e, "create temp directory"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         // Ensure only the current user can access the temp directory.
+        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| with_path_context(e, &temp_root, "set permissions"))?;
+            .map_err(|e| with_context(e, "set permissions on temp directory"))?;
     }
 
     // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
@@ -398,7 +414,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     let temp_dir = tempfile::Builder::new()
         .prefix("codex-arg0")
         .tempdir_in(&temp_root)
-        .map_err(|e| with_path_context(e, &temp_root, "create temp directory for arg0"))?;
+        .map_err(|e| with_context(e, "create temp directory for arg0"))?;
     let path = temp_dir.path();
 
     let lock_path = path.join(LOCK_FILENAME);
@@ -408,11 +424,15 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|e| with_path_context(e, &lock_path, "open lock file"))?;
+        .map_err(|e| with_context(e, "open lock file"))?;
     try_lock_arg0_dir(&lock_file, &lock_path)?;
 
-    let exe =
-        std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?;
+    let exe = match exe {
+        Some(exe) => exe.to_path_buf(),
+        None => {
+            std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?
+        }
+    };
 
     for filename in &[
         APPLY_PATCH_ARG0,
@@ -425,7 +445,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         #[cfg(unix)]
         {
             let link = path.join(filename);
-            symlink(&exe, &link).map_err(|e| with_path_context(e, &link, "create symlink"))?;
+            symlink(&exe, &link).map_err(|e| with_context(e, "create symlink"))?;
         }
 
         #[cfg(windows)]
@@ -436,7 +456,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
                 &batch_script,
                 format!("@echo off\r\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
             )
-            .map_err(|e| with_path_context(e, &batch_script, "write batch script"))?;
+            .map_err(|e| with_context(e, "write batch script"))?;
         }
     }
 
@@ -546,11 +566,6 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
 fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> {
     match lock_file.try_lock() {
         Ok(()) => Ok(()),
-        Err(std::fs::TryLockError::WouldBlock) => Err(with_path_context(
-            std::io::Error::from(std::fs::TryLockError::WouldBlock),
-            lock_path,
-            "acquire lock",
-        )),
         Err(err) => Err(with_path_context(
             std::io::Error::from(err),
             lock_path,
@@ -560,6 +575,7 @@ fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> 
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::expect_used)]
 mod tests {
     use super::Arg0DispatchPaths;
     use super::Arg0PathEntryGuard;
