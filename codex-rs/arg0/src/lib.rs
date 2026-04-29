@@ -2,8 +2,8 @@
 // Exceptions (allowed inline with #[allow] at use site):
 // - std::fs::TryLockError: fs_err has no lock API; must handle WouldBlock explicitly.
 // - std::fs::Permissions: type constructor, not a filesystem call.
-// - Test-only: std::fs::create_dir (fs_err has no create_dir, only create_dir_all)
-//   and std::fs::write (convenience in test setup, not the code under test).
+// - Test-only: std::fs::create_dir and std::fs::write
+//   (convenience in test setup, not the code under test).
 
 use std::future::Future;
 use std::path::Path;
