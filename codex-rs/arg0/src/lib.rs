@@ -1,3 +1,8 @@
+#![deny(clippy::disallowed_methods)]
+// Exceptions:
+// - std::fs::TryLockError: fs_err has no lock API; must handle WouldBlock explicitly.
+// - std::fs::create_dir: fs_err has no create_dir (only create_dir_all); used only in tests.
+
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
