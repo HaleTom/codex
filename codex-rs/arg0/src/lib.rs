@@ -16,7 +16,6 @@ use fs_err::File;
 #[cfg(unix)]
 use fs_err::os::unix::fs::symlink;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 const APPLY_PATCH_ARG0: &str = "apply_patch";
@@ -319,7 +318,8 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
-/// Use `deep_raw_os_error(&err)` to retrieve the original OS error code.
+/// The original OS code is preserved in the source chain and can be retrieved by
+/// walking `err.get_ref().source().downcast_ref::<io::Error>()` iteratively.
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
@@ -334,7 +334,9 @@ fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::
 /// Wraps an `io::Error` with a context string.
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
-/// the original was an OS error. Use `deep_raw_os_error(&err)` to retrieve it.
+/// the original was an OS error. The original OS code is preserved in the source
+/// chain and can be retrieved by walking `err.get_ref().source().downcast_ref::<io::Error>()`
+/// iteratively.
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
@@ -383,7 +385,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     #[cfg(unix)]
     {
         // Ensure only the current user can access the temp directory.
-        fs::set_permissions(&temp_root, PermissionsExt::from_mode(0o700))
+        fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| with_path_context(e, &temp_root, "set permissions"))?;
     }
 
@@ -460,7 +462,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     }
 
     let paths = Arg0DispatchPaths {
-        codex_self_exe: std::env::current_exe().ok(),
+        codex_self_exe: Some(exe.clone()),
         codex_linux_sandbox_exe: {
             #[cfg(target_os = "linux")]
             {
@@ -546,7 +548,7 @@ fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> 
         Err(std::fs::TryLockError::WouldBlock) => Err(with_path_context(
             std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                format!("lock is already held: {}", lock_path.display()),
+                "lock is already held",
             ),
             lock_path,
             "acquire lock",
