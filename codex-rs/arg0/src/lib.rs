@@ -306,12 +306,19 @@ impl std::error::Error for ContextIoError {
 /// `raw_os_error()`, if any. This is needed because `io::Error::new`
 /// clears `raw_os_error()` on the outer error even when the original
 /// was an OS error.
-#[cfg(test)]
+///
+/// Wrapper types like [`ContextIoError`] are transparently skipped —
+/// `source()` advances past them to the next node in the chain, where
+/// `downcast_ref::<io::Error>()` can then match the original error.
+#[allow(dead_code)]
 fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
     use std::error::Error;
     if let Some(code) = err.raw_os_error() {
         return Some(code);
     }
+    // Walk through intermediate wrapper types (e.g. ContextIoError) via
+    // source(). Only io::Error nodes carry raw_os_error(); other wrappers
+    // are bypassed by advancing to their source.
     let mut source = err.source();
     while let Some(s) = source {
         if let Some(io_err) = s.downcast_ref::<std::io::Error>()
@@ -334,8 +341,7 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
 /// The original OS code is preserved in the source chain and can be retrieved
-/// by walking the `source()` chain and calling `downcast_ref::<io::Error>()` on
-/// each source to check `raw_os_error()`.
+/// with [`deep_raw_os_error`].
 fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
     let path_display = path.display();
     std::io::Error::new(
@@ -351,8 +357,7 @@ fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error. The original OS code is preserved in the source
-/// chain and can be retrieved by walking the `source()` chain and calling
-/// `downcast_ref::<io::Error>()` on each source to check `raw_os_error()`.
+/// chain and can be retrieved with [`deep_raw_os_error`].
 fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
     std::io::Error::new(
         err.kind(),
@@ -451,10 +456,10 @@ pub fn prepend_path_entry_for_codex_aliases(
         #[cfg(windows)]
         {
             let batch_script = path.join(format!("{filename}.bat"));
-            let exe = exe.display();
+            let exe_display = exe.display();
             fs::write(
                 &batch_script,
-                format!("@echo off\r\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
+                format!("@echo off\r\n\"{exe_display}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
             )
             .map_err(|e| with_context(e, "write batch script"))?;
         }
