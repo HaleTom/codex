@@ -334,9 +334,9 @@ fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
 /// Wraps an `io::Error` with path and operation context.
 ///
 /// Use this for operations **not** covered by `fs_err`'s built-in path
-/// reporting (e.g. lock acquire). For `fs_err` calls that already include
-/// the path in their error message, prefer [`with_context`] instead to
-/// avoid duplicating the path in the output.
+/// reporting (e.g. lock acquire). For errors from `fs_err` operations
+/// (which already include the path), prefer [`with_context`] to add
+/// operation context without duplicating the path in the output.
 ///
 /// **Note:** The returned error's `raw_os_error()` returns `None` even when
 /// the original was an OS error, because `io::Error::new` clears it.
@@ -776,6 +776,35 @@ mod tests {
         assert!(
             source.to_string().contains("operation not permitted"),
             "source chain lost original error: {source}"
+        );
+    }
+
+    #[test]
+    fn with_context_on_fs_err_error_preserves_path_without_duplication() {
+        use super::with_context;
+        let nonexistent = "/nonexistent_path_that_does_not_exist_12345";
+        let fs_err_result: std::io::Result<String> = fs_err::read_to_string(nonexistent);
+        let fs_err_err = fs_err_result.unwrap_err();
+        let enriched = with_context(fs_err_err, "read config file");
+        let msg = enriched.to_string();
+        assert!(msg.contains("read config file"), "missing context: {msg}");
+        assert!(
+            msg.contains(nonexistent),
+            "fs_err path should be preserved in message: {msg}"
+        );
+        let path_count = msg.matches(nonexistent).count();
+        assert_eq!(
+            path_count, 1,
+            "path should appear exactly once (no duplication): {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains(nonexistent),
+            "source chain lost fs_err path: {source}"
         );
     }
 }
