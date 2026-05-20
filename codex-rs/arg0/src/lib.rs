@@ -1,4 +1,10 @@
-use std::fs::File;
+#![deny(clippy::disallowed_methods)]
+// Exceptions (allowed inline with #[allow] at use site):
+// - std::fs::TryLockError: fs_err has no lock API; must handle WouldBlock explicitly.
+// - std::fs::Permissions: type constructor, not a filesystem call.
+// - Test-only: std::fs::create_dir and std::fs::write
+//   (convenience in test setup, not the code under test).
+
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,8 +13,10 @@ use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_home_dir::find_codex_home;
+use fs_err as fs;
+use fs_err::File;
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use fs_err::os::unix::fs::symlink;
 use tempfile::TempDir;
 
 const APPLY_PATCH_ARG0: &str = "apply_patch";
@@ -33,12 +41,12 @@ pub struct Arg0DispatchPaths {
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
-    _lock_file: File,
+    _lock_file: fs_err::File,
     paths: Arg0DispatchPaths,
 }
 
 impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
+    fn new(temp_dir: TempDir, lock_file: fs_err::File, paths: Arg0DispatchPaths) -> Self {
         Self {
             _temp_dir: temp_dir,
             _lock_file: lock_file,
@@ -138,7 +146,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     // before creating any threads/the Tokio runtime.
     load_dotenv();
 
-    match prepend_path_entry_for_codex_aliases() {
+    let exe = std::env::current_exe().ok();
+    match prepend_path_entry_for_codex_aliases(exe.as_deref()) {
         Ok(path_entry) => Some(path_entry),
         Err(err) => {
             // It is possible that Codex will proceed successfully even if
@@ -182,12 +191,20 @@ where
     // would be nice to avoid leaving temporary directories behind, if possible.
     let path_entry_guard = arg0_dispatch();
 
+    // Reuse the current_exe from the guard when available, avoiding a
+    // redundant syscall. Fall back to a fresh current_exe() call when the
+    // guard was not created (e.g. prepend_path_entry_for_codex_aliases failed).
+    let current_exe = path_entry_guard
+        .as_ref()
+        .and_then(|g| g.paths().codex_self_exe.clone())
+        .or_else(|| std::env::current_exe().ok());
+
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
     let runtime = build_runtime()?;
     runtime.block_on(run_main_with_arg0_guard(
         path_entry_guard,
-        std::env::current_exe().ok(),
+        current_exe,
         main_fn,
     ))
 }
@@ -267,6 +284,90 @@ where
     }
 }
 
+#[derive(Debug)]
+struct ContextIoError {
+    context: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for ContextIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for ContextIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Walks the `source` chain of an `io::Error` to find the underlying
+/// `raw_os_error()`, if any. This is needed because `io::Error::new`
+/// clears `raw_os_error()` on the outer error even when the original
+/// was an OS error.
+///
+/// Wrapper types like [`ContextIoError`] are transparently skipped —
+/// `source()` advances past them to the next node in the chain, where
+/// `downcast_ref::<io::Error>()` can then match the original error.
+#[allow(dead_code)]
+fn deep_raw_os_error(err: &std::io::Error) -> Option<i32> {
+    use std::error::Error;
+    if let Some(code) = err.raw_os_error() {
+        return Some(code);
+    }
+    // Walk through intermediate wrapper types (e.g. ContextIoError) via
+    // source(). Only io::Error nodes carry raw_os_error(); other wrappers
+    // are bypassed by advancing to their source.
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>()
+            && let Some(code) = io_err.raw_os_error()
+        {
+            return Some(code);
+        }
+        source = s.source();
+    }
+    None
+}
+
+/// Wraps an `io::Error` with path and operation context.
+///
+/// Use this for operations **not** covered by `fs_err`'s built-in path
+/// reporting (e.g. lock acquire). For errors from `fs_err` operations
+/// (which already include the path), prefer [`with_context`] to add
+/// operation context without duplicating the path in the output.
+///
+/// **Note:** The returned error's `raw_os_error()` returns `None` even when
+/// the original was an OS error, because `io::Error::new` clears it.
+/// The original OS code is preserved in the source chain and can be retrieved
+/// with [`deep_raw_os_error`].
+fn with_path_context(err: std::io::Error, path: &Path, operation: &str) -> std::io::Error {
+    let path_display = path.display();
+    std::io::Error::new(
+        err.kind(),
+        ContextIoError {
+            context: format!("failed to {operation} `{path_display}`"),
+            source: err,
+        },
+    )
+}
+
+/// Wraps an `io::Error` with a context string.
+///
+/// **Note:** The returned error's `raw_os_error()` returns `None` even when
+/// the original was an OS error. The original OS code is preserved in the source
+/// chain and can be retrieved with [`deep_raw_os_error`].
+fn with_context(err: std::io::Error, context: &str) -> std::io::Error {
+    std::io::Error::new(
+        err.kind(),
+        ContextIoError {
+            context: context.to_owned(),
+            source: err,
+        },
+    )
+}
+
 /// Creates a temporary directory with either:
 ///
 /// - UNIX: `apply_patch` symlink to the current executable
@@ -281,8 +382,10 @@ where
 ///
 /// IMPORTANT: This function modifies the PATH environment variable, so it MUST
 /// be called before multiple threads are spawned.
-pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGuard> {
-    let codex_home = find_codex_home()?;
+pub fn prepend_path_entry_for_codex_aliases(
+    exe: Option<&Path>,
+) -> std::io::Result<Arg0PathEntryGuard> {
+    let codex_home = find_codex_home().map_err(|e| with_context(e, "resolve CODEX_HOME"))?;
     #[cfg(not(debug_assertions))]
     {
         // Guard against placing helpers in system temp directories outside debug builds.
@@ -297,16 +400,15 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         }
     }
 
-    std::fs::create_dir_all(&codex_home)?;
-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+    fs::create_dir_all(&codex_home).map_err(|e| with_context(e, "create CODEX_HOME directory"))?;
     let temp_root = codex_home.join("tmp").join("arg0");
-    std::fs::create_dir_all(&temp_root)?;
+    fs::create_dir_all(&temp_root).map_err(|e| with_context(e, "create temp directory"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         // Ensure only the current user can access the temp directory.
-        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| with_context(e, "set permissions on temp directory"))?;
     }
 
     // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
@@ -316,17 +418,26 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
 
     let temp_dir = tempfile::Builder::new()
         .prefix("codex-arg0")
-        .tempdir_in(&temp_root)?;
+        .tempdir_in(&temp_root)
+        .map_err(|e| with_context(e, "create temp directory for arg0"))?;
     let path = temp_dir.path();
 
     let lock_path = path.join(LOCK_FILENAME);
-    let lock_file = File::options()
+    let lock_file = fs_err::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)?;
-    lock_file.try_lock()?;
+        .open(&lock_path)
+        .map_err(|e| with_context(e, "open lock file"))?;
+    try_lock_arg0_dir(&lock_file, &lock_path)?;
+
+    let exe = match exe {
+        Some(exe) => exe.to_path_buf(),
+        None => {
+            std::env::current_exe().map_err(|e| with_context(e, "get current executable path"))?
+        }
+    };
 
     for filename in &[
         APPLY_PATCH_ARG0,
@@ -336,26 +447,21 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         #[cfg(unix)]
         EXECVE_WRAPPER_ARG0,
     ] {
-        let exe = std::env::current_exe()?;
-
         #[cfg(unix)]
         {
             let link = path.join(filename);
-            symlink(&exe, &link)?;
+            symlink(&exe, &link).map_err(|e| with_context(e, "create symlink"))?;
         }
 
         #[cfg(windows)]
         {
             let batch_script = path.join(format!("{filename}.bat"));
-            let exe = exe.display();
-            std::fs::write(
+            let exe_display = exe.display();
+            fs::write(
                 &batch_script,
-                format!(
-                    r#"@echo off
-"{exe}" {CODEX_CORE_APPLY_PATCH_ARG1} %*
-"#,
-                ),
-            )?;
+                format!("@echo off\r\n\"{exe_display}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\r\n"),
+            )
+            .map_err(|e| with_context(e, "write batch script"))?;
         }
     }
 
@@ -382,7 +488,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     }
 
     let paths = Arg0DispatchPaths {
-        codex_self_exe: std::env::current_exe().ok(),
+        codex_self_exe: Some(exe),
         codex_linux_sandbox_exe: {
             #[cfg(target_os = "linux")]
             {
@@ -409,7 +515,7 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
 }
 
 fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(temp_root) {
+    let entries = match fs::read_dir(temp_root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
@@ -426,7 +532,7 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
             continue;
         };
 
-        match std::fs::remove_dir_all(&path) {
+        match fs::remove_dir_all(&path) {
             Ok(()) => {}
             // Expected TOCTOU race: directory can disappear after read_dir/lock checks.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -439,7 +545,11 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
 
 fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
     let lock_path = dir.join(LOCK_FILENAME);
-    let lock_file = match File::options().read(true).write(true).open(&lock_path) {
+    let lock_file = match fs_err::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
@@ -452,7 +562,25 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
     }
 }
 
+/// Acquires the arg0 lock for the given directory, returning an error with
+/// path and operation context on failure.
+///
+/// Unlike `try_lock_dir` (used by the janitor), this function treats
+/// `WouldBlock` as a real error since it indicates the lock is already held
+/// by another process during normal startup.
+fn try_lock_arg0_dir(lock_file: &File, lock_path: &Path) -> std::io::Result<()> {
+    match lock_file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(err) => Err(with_path_context(
+            std::io::Error::from(err),
+            lock_path,
+            "acquire lock",
+        )),
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::expect_used)]
 mod tests {
     use super::Arg0DispatchPaths;
     use super::Arg0PathEntryGuard;
@@ -464,14 +592,13 @@ mod tests {
     #[cfg(unix)]
     use anyhow::ensure;
     use std::fs;
-    use std::fs::File;
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn create_lock(dir: &Path) -> std::io::Result<File> {
+    fn create_lock(dir: &Path) -> std::io::Result<fs_err::File> {
         let lock_path = dir.join(LOCK_FILENAME);
-        File::options()
+        fs_err::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -581,5 +708,103 @@ mod tests {
 
         assert!(!dir.exists());
         Ok(())
+    }
+
+    #[test]
+    fn with_path_context_includes_operation_path_and_source() {
+        use super::with_path_context;
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let path = std::path::PathBuf::from("/some/missing/path");
+        let expected = path.display().to_string();
+        let enriched = with_path_context(not_found, &path, "read config file");
+        assert_eq!(enriched.kind(), std::io::ErrorKind::NotFound);
+        let msg = enriched.to_string();
+        assert!(msg.contains("read config file"), "missing operation: {msg}");
+        assert!(msg.contains(&expected), "missing path: {msg}");
+        assert!(
+            msg.contains("no such file"),
+            "missing original message: {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains("no such file"),
+            "source chain lost original error: {source}"
+        );
+    }
+
+    #[test]
+    fn deep_raw_os_error_retrieves_original_os_code() {
+        use super::{deep_raw_os_error, with_path_context};
+        let eofs = std::io::Error::from_raw_os_error(30);
+        let path = std::path::PathBuf::from("/readonly/fs");
+        let enriched = with_path_context(eofs, &path, "open");
+        assert!(
+            enriched.raw_os_error().is_none(),
+            "outer raw_os_error should be None (cleared by Error::new)"
+        );
+        assert_eq!(
+            deep_raw_os_error(&enriched),
+            Some(30),
+            "deep_raw_os_error should find the original OS error code"
+        );
+    }
+
+    #[test]
+    fn with_context_includes_custom_message_and_source() {
+        use super::with_context;
+        let permission_denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operation not permitted",
+        );
+        let enriched = with_context(permission_denied, "resolve CODEX_HOME");
+        assert_eq!(enriched.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = enriched.to_string();
+        assert!(msg.contains("resolve CODEX_HOME"), "missing context: {msg}");
+        assert!(
+            msg.contains("operation not permitted"),
+            "missing original error: {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains("operation not permitted"),
+            "source chain lost original error: {source}"
+        );
+    }
+
+    #[test]
+    fn with_context_on_fs_err_error_preserves_path_without_duplication() {
+        use super::with_context;
+        let nonexistent = "/nonexistent_path_that_does_not_exist_12345";
+        let fs_err_result: std::io::Result<String> = fs_err::read_to_string(nonexistent);
+        let fs_err_err = fs_err_result.unwrap_err();
+        let enriched = with_context(fs_err_err, "read config file");
+        let msg = enriched.to_string();
+        assert!(msg.contains("read config file"), "missing context: {msg}");
+        assert!(
+            msg.contains(nonexistent),
+            "fs_err path should be preserved in message: {msg}"
+        );
+        let path_count = msg.matches(nonexistent).count();
+        assert_eq!(
+            path_count, 1,
+            "path should appear exactly once (no duplication): {msg}"
+        );
+        let source = enriched
+            .get_ref()
+            .expect("should have a source")
+            .source()
+            .expect("ContextIoError should expose source chain");
+        assert!(
+            source.to_string().contains(nonexistent),
+            "source chain lost fs_err path: {source}"
+        );
     }
 }
